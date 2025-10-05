@@ -1,0 +1,7 @@
+tensorflow==2.12.0
+scipy
+pyyaml
+opencv-python>=4.7.0
+fastapi
+uvicorn
+
