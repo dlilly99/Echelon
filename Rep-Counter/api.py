@@ -1,26 +1,41 @@
-import io
-import time
-import cv2
-import numpy as np
-import tensorflow.compat.v1 as tf
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-import posenet
 import os
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from typing import List, Optional
+import datetime
+import base64
+import numpy as np
+import cv2
+import google.generativeai as genai
+import json
+import re
 
-# ---- FastAPI setup ----
+# Local imports
+from database import get_all_workouts, create_workout
+import posenet
+
 app = FastAPI()
 
-# Serve built React frontend
-app.mount("/static", StaticFiles(directory="frontend/build/static"), name="static")
+# Global model variable
+model = None
 
-@app.get("/")
-def serve_react():
-    return FileResponse("frontend/build/index.html")
+# Configure the Gemini API key
+try:
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+except KeyError:
+    print("[ERROR] GEMINI_API_KEY environment variable not set.")
+    # You might want to exit or handle this more gracefully
+    # For now, the app will fail at runtime if the key is needed.
 
-# Allow frontend access
+@app.on_event("startup")
+async def startup_event():
+    """Loads the PoseNet model on application startup."""
+    print("[INIT] Loading PoseNet MobileNet 50...")
+    global model
+    model = posenet.load_model(101)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,161 +44,109 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Globals ----
-rep_count = 0
-angle_value = 0.0
-current_state = ["down"]
+def parse_ai_response(text: str) -> List[dict]:
+    """Parses the AI's text response to extract exercises into a structured list."""
+    try:
+        # Attempt to find a JSON block in the response
+        json_match = re.search(r"```json\n([\s\S]*?)\n```", text)
+        if json_match:
+            json_str = json_match.group(1)
+            # The AI might output a string that is a JSON representation of a list
+            # e.g., '"[{\\"name\\": \\"Push-ups\\", ...}]"'
+            # Or it might just be the list itself.
+            # json.loads can handle both cases.
+            loaded_json = json.loads(json_str)
+            if isinstance(loaded_json, str):
+                 # If it's a string, parse it again
+                return json.loads(loaded_json)
+            return loaded_json
+        else:
+            # Fallback for plain text if no JSON block is found (less reliable)
+            print("[PARSER] No JSON block found, attempting plain text parsing.")
+            exercises = []
+            # Simple parsing logic, can be improved
+            for line in text.split('\n'):
+                if '. ' in line:
+                    parts = line.split('. ', 1)
+                    if len(parts) > 1 and parts[0].isdigit():
+                        exercises.append({"name": parts[1], "reps": "10", "sets": 3}) # Dummy values
+            return exercises
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"[PARSER ERROR] Failed to parse AI response: {e}")
+        print(f"[PARSER ERROR] Raw text was: {text}")
+        return [] # Return empty list on failure
 
-# ---- Detection / Rep logic thresholds ----
-SCALE_FACTOR = 0.9
-MIN_POSE_SCORE = 0.05
-MIN_JOINT_CONF = 0.05
-LOW_TH = 70.0
-HIGH_TH = 140.0
-EMA_ALPHA = 0.4
-COOLDOWN_SEC = 0.5
+@app.post("/api/generate-and-save")
+async def generate_and_save(data: dict = Body(...)):
+    """Generates a workout using an AI model, saves it, and returns it."""
+    prompt = data.get("prompt", "Give me a good workout")
+    user_id = data.get("userId", "anon")
 
-# ---- TensorFlow / PoseNet ----
-tf.disable_eager_execution()
-sess = tf.Session()
-print("[INIT] Loading PoseNet MobileNet 50...")
-model_cfg, model_outputs = posenet.load_model(50, sess)
-output_stride = model_cfg["output_stride"]
+    print(f"[API] Generating workout for prompt: '{prompt}'")
 
-# Weak-frame tracking for model upgrade
-low_conf_count = 0
-low_conf_limit = 10  # upgrade after too many weak frames
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        
+        # A more specific prompt to guide the AI towards a JSON output
+        full_prompt = f"""
+        Based on the user's request: "{prompt}", generate a list of 6 exercises.
+        Return the response as a single JSON object enclosed in ```json ... ```.
+        The JSON object should be a list of dictionaries. Each dictionary must contain these keys: 'index', 'name', 'description', 'equipment', 'reps', 'sets'.
+        Example format:
+        ```json
+        [
+            {{"index": 1, "name": "Push-ups", "description": "Standard push-ups", "equipment": "Bodyweight", "reps": "15", "sets": 3}},
+            {{"index": 2, "name": "Squats", "description": "Bodyweight squats", "equipment": "Bodyweight", "reps": "20", "sets": 3}}
+        ]
+        ```
+        """
+        
+        response = await model.generate_content_async(full_prompt)
+        raw_text = response.text
+        
+        print(f"[AI RESPONSE] Raw text received:\n{raw_text}")
 
-def switch_to_resnet():
-    """Upgrade to higher-accuracy PoseNet model."""
-    global model_cfg, model_outputs, output_stride, sess
-    print("\n⚙️ [MODEL UPGRADE] Switching to PoseNet ResNet-101 for higher accuracy...\n")
-    sess.close()
-    sess = tf.Session()
-    model_cfg, model_outputs = posenet.load_model(101, sess)
-    output_stride = model_cfg["output_stride"]
+        exercises = parse_ai_response(raw_text)
 
-# ---- Helpers ----
-def calculate_angle(a, b, c):
-    """Calculate joint angle from three keypoints."""
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    ba, bc = a - b, c - b
-    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
-    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+        if not exercises:
+            raise HTTPException(status_code=500, detail="Failed to parse workout from AI response.")
 
-def preprocess_frame(frame, scale_factor, output_stride):
-    """Resize, normalize, and prepare frame for PoseNet."""
-    h, w = frame.shape[:2]
-    target_w = int(w * scale_factor)
-    target_h = int(h * scale_factor)
-    img = cv2.resize(frame, (target_w, target_h))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    img = np.expand_dims(img, axis=0)
-    return img, frame.copy(), 1.0 / scale_factor
+        workout_data = {
+            "userId": user_id,
+            "prompt": prompt,
+            "rawText": raw_text,
+            "exercises": exercises,
+            "createdAt": datetime.datetime.utcnow(),
+            "updatedAt": datetime.datetime.utcnow(),
+        }
 
-def _ensure_attrs():
-    """Initialize persistent variables used for tracking."""
-    if not hasattr(process_frame, "ema_angle"):
-        process_frame.ema_angle = None
-    if not hasattr(process_frame, "last_rep_time"):
-        process_frame.last_rep_time = 0.0
-    if not hasattr(process_frame, "state"):
-        process_frame.state = "down"
+        workout_id = create_workout(workout_data)
+        
+        response_data = workout_data.copy()
+        response_data["_id"] = str(workout_id)
+        response_data["createdAt"] = response_data["createdAt"].isoformat()
+        response_data["updatedAt"] = response_data["updatedAt"].isoformat()
 
-# ---- Main endpoint ----
+        return response_data
+
+    except Exception as e:
+        print(f"[API ERROR] Failed to generate or save workout: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workouts", response_model=List[dict])
+async def list_workouts(userId: Optional[str] = "anon"):
+    workouts = get_all_workouts(userId)
+    return workouts
+
 @app.post("/frame")
-async def process_frame(file: UploadFile = File(...)):
-    global rep_count, angle_value, low_conf_count
-    _ensure_attrs()
+async def process_frame(data: dict = Body(...)):
+    """Receives a video frame, estimates pose, and returns keypoints."""
+    image_data = data.get("image")
+    if not image_data:
+        raise HTTPException(status_code=400, detail="No image data provided.")
 
-    # ---- Read frame ----
-    contents = await file.read()
-    npimg = np.frombuffer(contents, np.uint8)
-    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    if frame is None:
-        return JSONResponse({"count": rep_count, "angle": None, "status": "bad frame"})
-
-    # ---- PoseNet inference ----
-    input_image, _, output_scale = preprocess_frame(frame, SCALE_FACTOR, output_stride)
-    heatmaps, offsets, disp_fwd, disp_bwd = sess.run(model_outputs, feed_dict={"image:0": input_image})
-
-    pose_scores, keypoint_scores, keypoint_coords = posenet.decode_multi.decode_multiple_poses(
-        heatmaps.squeeze(0),
-        offsets.squeeze(0),
-        disp_fwd.squeeze(0),
-        disp_bwd.squeeze(0),
-        output_stride=output_stride,
-        max_pose_detections=1,
-        min_pose_score=MIN_POSE_SCORE,
-    )
-
-    # ---- Guard: no detections ----
-    if pose_scores is None or len(pose_scores) == 0:
-        low_conf_count += 1
-        if low_conf_count >= low_conf_limit:
-            switch_to_resnet()
-            low_conf_count = 0
-        return JSONResponse({"count": rep_count, "angle": None, "status": "no person"})
-
-    keypoint_coords *= output_scale
-    pose_score = float(pose_scores[0])
-
-    # ---- Debug info ----
-    print(f"[DEBUG] pose_score={pose_score:.3f}")
-    print(f"[DEBUG] left_arm_conf={keypoint_scores[0][5]:.2f}, {keypoint_scores[0][7]:.2f}, {keypoint_scores[0][9]:.2f}")
-    print(f"[DEBUG] right_arm_conf={keypoint_scores[0][6]:.2f}, {keypoint_scores[0][8]:.2f}, {keypoint_scores[0][10]:.2f}")
-
-    # ---- Handle weak detections ----
-    if pose_score < MIN_POSE_SCORE:
-        low_conf_count += 1
-        if low_conf_count >= low_conf_limit:
-            switch_to_resnet()
-            low_conf_count = 0
-        return JSONResponse({"count": rep_count, "angle": None, "status": "no person"})
-    else:
-        low_conf_count = 0
-
-    # ---- Select stronger arm ----
-    left_conf = np.sum(keypoint_scores[0][[5, 7, 9]])
-    right_conf = np.sum(keypoint_scores[0][[6, 8, 10]])
-    if right_conf >= left_conf:
-        shoulder, elbow, wrist = keypoint_coords[0][6], keypoint_coords[0][8], keypoint_coords[0][10]
-        arm = "right"
-    else:
-        shoulder, elbow, wrist = keypoint_coords[0][5], keypoint_coords[0][7], keypoint_coords[0][9]
-        arm = "left"
-
-    # ---- Check joint confidence ----
-    if np.any(keypoint_scores[0][[5, 7, 9]] < MIN_JOINT_CONF) and np.any(keypoint_scores[0][[6, 8, 10]] < MIN_JOINT_CONF):
-        return JSONResponse({"count": rep_count, "angle": None, "status": "low confidence"})
-
-    # ---- Compute angle and smooth ----
-    raw_angle = float(calculate_angle(shoulder, elbow, wrist))
-    if process_frame.ema_angle is None:
-        process_frame.ema_angle = raw_angle
-    else:
-        process_frame.ema_angle = EMA_ALPHA * raw_angle + (1 - EMA_ALPHA) * process_frame.ema_angle
-    angle_smoothed = process_frame.ema_angle
-    angle_value = angle_smoothed
-
-    # ---- Rep counting ----
-    now = time.time()
-
-    if angle_smoothed > HIGH_TH:
-        process_frame.state = "down"
-    elif angle_smoothed < LOW_TH and process_frame.state == "down" and (now - process_frame.last_rep_time) > COOLDOWN_SEC:
-        rep_count += 1
-        process_frame.state = "up"
-        process_frame.last_rep_time = now
-        print(f"✅ REP COUNTED! total={rep_count}, arm={arm}, angle={angle_smoothed:.1f}")
-
-    return JSONResponse({
-        "count": rep_count,
-        "angle": round(angle_smoothed, 1),
-        "status": f"ok ({arm})"
-    })
-
-# ---- Quick check endpoint ----
-@app.get("/count")
-def get_count():
-    return JSONResponse({"count": rep_count, "angle": angle_value})
+    # Use the global model to estimate pose
+    pose_scores, keypoint_scores, keypoint_coords = model(image_data)
+    keypoints = keypoint_coords[0]  # Get first pose
+    return {"keypoints": keypoints}
